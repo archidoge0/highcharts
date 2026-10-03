@@ -1,0 +1,173 @@
+name: "ghav human: Highcharts Playwright Visual Comparison"
+"on":
+  push:
+    branches:
+      - ghav/dev/25342
+    paths:
+      - .ghav/human
+permissions:
+  contents: read
+jobs:
+  visual_playwright_compare:
+    name: Playwright visual comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Preserve candidate visual harness
+        run: |
+          tar -czf "$RUNNER_TEMP/visual-harness.tar.gz" \
+            package.json \
+            package-lock.json \
+            playwright.config.ts \
+            test/karma-files.json \
+            test/visual-comparator.js \
+            test/visual-test-samples.js \
+            tests/fixtures.ts \
+            tests/globals.d.ts \
+            tests/qunit/utils/browser-log-note-reporter.ts \
+            tests/setup-highcharts.mts \
+            tests/package.json \
+            tests/package-lock.json \
+            tests/tsconfig.json \
+            tests/utils.ts \
+            tools/docs-preview/package.json \
+            tests/visual
+      - name: Checkout pinned master reference
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.revisions.outputs.reference_sha }}
+          clean: true
+          fetch-depth: 0
+      - name: Restore candidate visual harness
+        run: tar -xzf "$RUNNER_TEMP/visual-harness.tar.gz" -C "$GITHUB_WORKSPACE"
+      - name: Use Node.js lts/*
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            tests/package-lock.json
+      - name: Install candidate toolchain for reference
+        run: npm ci
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Select comparable visual samples
+        run: |
+          node --import tsx <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { selectVisualSamples } = require('./tests/visual/visual-samples.ts');
+          const requested = new Set(require('./tests/visual/samples.json'));
+          const comparable = selectVisualSamples(process.cwd())
+            .map(sample => sample.id)
+            .filter(id => requested.has(id));
+          if (!comparable.length) throw new Error('No comparable visual samples');
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'visual-samples.json'),
+            JSON.stringify(comparable));
+          console.log(`Comparing ${comparable.length} of ${requested.size} candidate samples present and eligible in both revisions.`);
+          NODE
+      - name: Generate master reference
+        id: reference
+        continue-on-error: true
+        env:
+          VISUAL_TEST_MANIFEST: ${{ runner.temp }}/visual-samples.json
+          VISUAL_TEST_REFERENCE: "1"
+        run: npx playwright test tests/visual/visual.spec.ts --project=visual
+      - name: Preserve reference visual evidence
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/visual-reference"
+          mkdir -p "$RUNNER_TEMP/visual-reference"
+
+          find samples -type f -name reference.svg -print0 |
+          while IFS= read -r -d '' file; do
+            target="$RUNNER_TEMP/visual-reference/$file"
+            mkdir -p "$(dirname "$target")"
+            cp "$file" "$target"
+          done
+
+          for file in \
+            test/visual-test-results.json \
+            test/visual-test-errors.log; do
+            if [ -f "$file" ]; then
+              target="$RUNNER_TEMP/visual-reference/$file"
+              mkdir -p "$(dirname "$target")"
+              cp "$file" "$target"
+            fi
+          done
+
+          for directory in playwright-report test-results; do
+            if [ -d "$directory" ]; then
+              mkdir -p "$RUNNER_TEMP/visual-reference/$directory"
+              cp -R "$directory/." "$RUNNER_TEMP/visual-reference/$directory"
+            fi
+          done
+      - name: Checkout candidate revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.revisions.outputs.candidate_sha }}
+          clean: true
+          fetch-depth: 0
+      - name: Restore reference renderings
+        run: |
+          if [ -d "$RUNNER_TEMP/visual-reference/samples" ]; then
+            mkdir -p samples
+            cp -R "$RUNNER_TEMP/visual-reference/samples/." samples
+          fi
+      - name: Install candidate toolchain
+        run: npm ci
+      - name: Run candidate visual comparison
+        id: candidate
+        continue-on-error: true
+        env:
+          VISUAL_TEST_MANIFEST: ${{ runner.temp }}/visual-samples.json
+        run: npx playwright test --project=visual
+      - name: Verify visual run outcomes
+        if: always()
+        env:
+          REFERENCE_OUTCOME: ${{ steps.reference.outcome }}
+          CANDIDATE_OUTCOME: ${{ steps.candidate.outcome }}
+        run: |
+          failures=0
+
+          if [ "$REFERENCE_OUTCOME" != "success" ]; then
+            echo "::error::Reference step outcome: $REFERENCE_OUTCOME"
+            failures=1
+          fi
+          if [ "$CANDIDATE_OUTCOME" != "success" ]; then
+            echo "::error::Candidate step outcome: $CANDIDATE_OUTCOME"
+            failures=1
+          fi
+          if [ ! -f test/visual-test-complete ]; then
+            echo "::error::Candidate visual test completion marker is missing."
+            failures=1
+          fi
+          if [ -s test/visual-test-errors.log ]; then
+            echo "::error::Visual test execution errors were recorded."
+            failures=1
+          fi
+
+          exit "$failures"
+      - name: Upload Playwright visual evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: playwright-visual-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/visual-samples.json
+            ${{ runner.temp }}/visual-reference
+            samples/**/reference.svg
+            samples/**/candidate.svg
+            samples/**/diff.gif
+            test/visual-test-results.json
+            test/visual-test-errors.log
+            test/visual-test-complete
+            tmp/pr-visual-test-comment.json
+            playwright-report
+            test-results
